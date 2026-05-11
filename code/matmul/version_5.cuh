@@ -67,40 +67,40 @@ __device__ void wgmma(float c[2][64], bf16 *sa, bf16 *sb) {
     );
 }
 
-template<int SMs, int BM, int BN, int WM, int WN>
+// ============================================================
+// Tile-aware scheduler (referenced from matmul_6.cuh Schedule<1>)
+// Uses TM x TN super-tiles for better L2 locality:
+//   - Within a super-tile, blocks share A rows and B columns
+//   - Adjacent SMs work on adjacent super-tiles
+// ============================================================
+template<int NUM_SM, int BM, int BN, int TM = 16, int TN = 8>
 struct Scheduler {
-    int it_;
-    int blockIdx_;
-    int total_block_at_m_; // block at m dim
-    int total_block_at_n_; // block at n dim
+    int block;
+    int it;
+    int total_blocks_m;
+    int total_blocks_n;
 
-    __device__ __forceinline__ Scheduler(int M, int N, int blockIdx) {
-        total_block_at_m_ = M / BM;
-        total_block_at_n_ = N / BN;
-        blockIdx_ = blockIdx;
-        it_ = 0; // be careful
-        assert(total_block_at_m_ % WM == 0);
-        assert(total_block_at_n_ % WN == 0);
-        assert(SMs == WM * WN);
-        assert(blockIdx_ < SMs);
+    __device__ __forceinline__ Scheduler(int M, int N, int _block) {
+        block = _block;
+        it = 0;
+        total_blocks_m = M / BM;
+        total_blocks_n = N / BN;
+        assert(total_blocks_m % TM == 0 && total_blocks_n % TN == 0);
     }
 
-    __device__ __forceinline__ int next() {
-        int block_id = it_ * SMs + blockIdx_;
-        if(block_id >= total_block_at_m_*total_block_at_n_)
-            return -1;
-        
-        // which tile
-        int tile_id = block_id / (WM * WN);
-        int m = tile_id / (total_block_at_n_ / WN) * WM;
-        int n = tile_id % (total_block_at_n_ / WN) * WN;
-        // which block
-        m += (blockIdx_ / WN);
-        n += (blockIdx_ % WN);
+    // Returns false when no more tiles available
+    __device__ __forceinline__ bool next(int &block_m, int &block_n) {
+        int num = it * NUM_SM + block;
+        if (num >= total_blocks_m * total_blocks_n) return false;
 
-        it_++;
-
-        return m * total_block_at_n_ + n;
+        int cur_tile      = num / (TM * TN);
+        int cur_tile_pos  = num % (TM * TN);
+        block_m = TM * (cur_tile / (total_blocks_n / TN));
+        block_n = TN * (cur_tile % (total_blocks_n / TN));
+        block_m += cur_tile_pos / TN;
+        block_n += cur_tile_pos % TN;
+        ++it;
+        return true;
     }
 };
 
@@ -118,8 +118,7 @@ __global__ void kernel(int M, int N, int K,
     static_assert(block_m / wgmma_m == 2 && block_k / wgmma_k == 4
                         && block_n == wgmma_n);
 
-    // Scheduler<num_sm, block_m, block_n, 8, 16> scheduler(M, N, blockIdx.x);
-    Scheduler<num_sm, block_m, block_n, 16, 8> scheduler(M, N, blockIdx.x); // better performance
+    Scheduler<num_sm, block_m, block_n> scheduler(M, N, blockIdx.x);
 
     extern __shared__ __align__(128) uint8_t smem[];
     SMem<block_m, block_n, block_k, num_stage> &s = *reinterpret_cast<SMem<block_m, block_n, block_k, num_stage>*>(smem);
@@ -148,35 +147,25 @@ __global__ void kernel(int M, int N, int K,
     int wg_id = threadIdx.x / 128;
     if(wg_id == 0) { // producer
         if (threadIdx.x == 0) {
-            for(int block_id = scheduler.next(); block_id >= 0; block_id = scheduler.next()) {
-                int block_m_id = block_id / (N / block_n);
-                int block_n_id = block_id % (N / block_n);
-                if(blockIdx.x == 0) {
-                    printf("producer: %d, %d\n", block_m_id, block_n_id);
-                }
+            int bm, bn;
+            while (scheduler.next(bm, bn)) {
                 for(int ok = 0; ok < K / block_k; ok ++) {
                     empty[ok%num_stage].wait(empty[ok%num_stage].arrive());
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(smem_a+(ok%num_stage)*block_m*block_k, &a, ok*block_k, block_m_id*block_m, full[ok%num_stage]); // be careful, k first then m
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(smem_b+(ok%num_stage)*block_n*block_k, &b, ok*block_k, block_n_id*block_n, full[ok%num_stage]); // be careful, k first then n
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(smem_a+(ok%num_stage)*block_m*block_k, &a, ok*block_k, bm*block_m, full[ok%num_stage]); // be careful, k first then m
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(smem_b+(ok%num_stage)*block_n*block_k, &b, ok*block_k, bn*block_n, full[ok%num_stage]); // be careful, k first then n
                     barrier::arrival_token _ = cuda::device::barrier_arrive_tx(full[ok%num_stage], 1, (block_m*block_k + block_n*block_k)*sizeof(bf16));
                 }
             }
         }
     } else { // consumer
-        float frag_c[2][64] = {0};
-        static_assert(sizeof(frag_c) * 128 == block_m / 2 * block_n * sizeof(float));
-
         for(int ns = 0; ns < num_stage; ns ++) {
             barrier::arrival_token _ = empty[ns].arrive();
         }
 
-        for(int block_id = scheduler.next(); block_id >= 0; block_id = scheduler.next()) {
-        int block_m_id = block_id / (N / block_n);
-        int block_n_id = block_id % (N / block_n);
-
-        if((blockIdx.x == 0) && (threadIdx.x == 128 || threadIdx.x == 256)) {
-            printf("consumer: %d, %d\n", block_m_id, block_n_id);
-        }
+        int bm, bn;
+        while (scheduler.next(bm, bn)) {
+        float frag_c[2][64] = {0};
+        static_assert(sizeof(frag_c) * 128 == block_m / 2 * block_n * sizeof(float));
 
         for(int ok = 0; ok < K / block_k; ok ++) {
             full[ok%num_stage].wait(full[ok%num_stage].arrive());
@@ -203,10 +192,10 @@ __global__ void kernel(int M, int N, int K,
             lane = threadIdx.x % 32,
             row_offset = lane / 4,
             col_offset = lane % 4 * 2;
-        float* c_ptr = c + 
-                block_m_id * block_m * N + 
-                block_n_id * block_n;
-        
+        float* c_ptr = c +
+                bm * block_m * N +
+                bn * block_n;
+
         // #pragma unroll
         // for(int im = 0; im < block_m / wgmma_m; im++) {
             #pragma unroll
@@ -229,24 +218,32 @@ void runKernel5(int M, int N, int K, bf16 *A, bf16 *B, float *C) {
     constexpr int block_n = 256;
     constexpr int block_k = 64;
     constexpr int num_stage = 3;
-    constexpr int num_sm = 128;
 
-    // constexpr int smem_size = num_stage * (block_m * block_k + block_n * block_k) * sizeof(bf16) / 1024; // shm
     CUtensorMap tensor_a, tensor_b;
     createTensorMap(A, M, K, block_m, block_k, &tensor_a);
     createTensorMap(B, N, K, block_n, block_k, &tensor_b);
 
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int runtime_num_sm = prop.multiProcessorCount;
+
     dim3 block(128 * 3);
-    dim3 grid(num_sm);
-    // dim3 grid(N / block_n, M / block_m);
+    size_t smem_size = (block_m * block_k + block_n * block_k) * num_stage * sizeof(bf16);
 
-    auto *kernel_ptr = kernel<num_stage, block_m, block_n, block_k, num_sm>;
-    size_t smem_size = sizeof(SMem<block_m, block_n, block_k, num_stage>);
-    cudaFuncSetAttribute(
-        kernel_ptr,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-
-    kernel_ptr<<<grid, block, smem_size>>>(M, N, K, C, tensor_a, tensor_b);
+    switch (runtime_num_sm) {
+    case 78: {
+        dim3 grid(runtime_num_sm);
+        auto *kernel_ptr = kernel<num_stage, block_m, block_n, block_k, 78>;
+        cudaFuncSetAttribute(
+            kernel_ptr,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel_ptr<<<grid, block, smem_size>>>(M, N, K, C, tensor_a, tensor_b);
+        break;
+    }
+    default:
+        printf("runKernel5 unsupported SM count: %d\n", runtime_num_sm);
+        return;
+    }
 
     // 立即检查启动错误
     cudaError_t launchError = cudaGetLastError();

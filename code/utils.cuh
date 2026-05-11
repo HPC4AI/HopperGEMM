@@ -122,6 +122,28 @@ void verifyMatrix(T *ref, T *in, size_t row, size_t col, float tol) {
     std::cout << "[SUCCESS] pass verify!" << std::endl;
 }
 
+// Silent version: returns true if passed, false if failed (no output on success)
+template <typename T>
+bool verifyMatrixSilent(T *ref, T *in, size_t row, size_t col, float tol) {
+    int error_count = 0;
+    for(int i = 0; i < row; i ++) {
+        for(int j = 0; j < col; j ++) {
+            float diff = static_cast<float>(ref[i * col + j] - in[i * col + j]);
+            if(diff > tol || diff < -tol) {
+                if (error_count < 5) { // Print first 5 errors
+                    std::cout << "  [ERROR] position (" << i << ", " << j << ") has a diff " << diff
+                              << ", ref = " << ref[i * col + j] << ", in = " << in[i * col + j] << std::endl;
+                }
+                error_count++;
+            }
+        }
+    }
+    if (error_count > 5) {
+        std::cout << "  ... and " << (error_count - 5) << " more errors." << std::endl;
+    }
+    return error_count == 0;
+}
+
 template <typename T>
 __host__ __device__ void printMatrix(T *in_ptr, size_t row, size_t col, const char *str) {
     printf("%s\n", str);

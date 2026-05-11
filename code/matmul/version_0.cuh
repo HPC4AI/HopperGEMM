@@ -9,6 +9,7 @@ void runCublas(size_t M, size_t N, size_t K, bf16 *A, bf16 *B, float *C) {
     cublasHandle_t handle;
     cublasCreate(&handle);
     float alpha = 1.0f, beta = 0.0f; // use float type
+    // cublasGemmEx默认情况下A / B / C都是列主序
     cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
         &alpha, B, CUDA_R_16BF, K, // k major
@@ -20,16 +21,15 @@ void runCublas(size_t M, size_t N, size_t K, bf16 *A, bf16 *B, float *C) {
 }
 
 void runCpu(size_t M, size_t N, size_t K, bf16 *A, bf16 *B, float *C) {
-    #pragma omp prallel
+    #pragma omp parallel for
     for(int i = 0; i < M; i ++) {
-        #pragma omp prallel
+        #pragma omp parallel for
         for(int j = 0; j < N; j ++) {
             float sum  = 0.0;
             for(int k = 0; k < K; k ++) {
-                sum += static_cast<float>(A[i * K + k]) * 
-                    static_cast<float>(B[k + j * K]);
+                sum += static_cast<float>(A[i * K + k]) * static_cast<float>(B[k + j * K]); // A / B都是k major
             }
-            C[i * N + j] = sum;
+            C[i * N + j] = sum; // C是col major
         }
     }
 }

@@ -92,8 +92,9 @@ __global__ void kernel(int M, int N, int K,
     __syncthreads();
 
     /////// lgsts ///////
-    __shared__ __align__(128) bf16 smem_a[num_stage * tile_m * tile_k];
-    __shared__ __align__(128) bf16 smem_b[num_stage * tile_n * tile_k];
+    extern __shared__ __align__(128) uint8_t smem[];
+    bf16 *smem_a = reinterpret_cast<bf16*>(smem);
+    bf16 *smem_b = smem_a + num_stage * tile_m * tile_k;
 
     int wg_id = threadIdx.x / 128;
     if(wg_id == 0) { // producer
@@ -164,7 +165,7 @@ void runKernel4(int M, int N, int K, bf16 *A, bf16 *B, float *C) {
     constexpr int tile_k = 64;
     constexpr int num_stage = 3;
 
-    constexpr int smem_size = num_stage * (tile_m * tile_k + tile_n * tile_k) * sizeof(bf16) / 1024; // shm
+    constexpr int smem_size = num_stage * (tile_m * tile_k + tile_n * tile_k) * sizeof(bf16);
     CUtensorMap tensor_a, tensor_b;
     createTensorMap(A, M, K, tile_m, tile_k, &tensor_a);
     createTensorMap(B, N, K, tile_n, tile_k, &tensor_b);
@@ -178,7 +179,7 @@ void runKernel4(int M, int N, int K, bf16 *A, bf16 *B, float *C) {
         kernel_ptr,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    kernel_ptr<<<grid, block>>>(M, N, K, C, tensor_a, tensor_b);
+    kernel_ptr<<<grid, block, smem_size>>>(M, N, K, C, tensor_a, tensor_b);
 
     // 立即检查启动错误
     cudaError_t launchError = cudaGetLastError();
